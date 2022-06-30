@@ -36,6 +36,7 @@
 
 #include <gst/gst.h>
 #include <gst/gst.h>
+#include <string.h>
 
 #include "gst/gstelement.h"
 #include "gst/gstinfo.h"
@@ -67,10 +68,10 @@ static void gst_whip_sink_finalize (GObject * object);
 static GstPad *gst_whip_sink_request_new_pad (GstElement * element,
     GstPadTemplate * templ, const gchar * name, const GstCaps * caps);
 static void gst_whip_sink_release_pad (GstElement * element, GstPad * pad);
-static void gst_whip_sink_state_changed (GstElement * element, GstState oldstate,
-    GstState newstate, GstState pending);
-// static GstStateChangeReturn gst_whip_sink_change_state (GstElement *element, 
-    // GstStateChange transition);
+static void gst_whip_sink_state_changed (GstElement * element,
+    GstState oldstate, GstState newstate, GstState pending);
+static GstStateChangeReturn gst_whip_sink_change_state (GstElement * element,
+    GstStateChange transition);
 
 /* pad templates */
 
@@ -93,15 +94,134 @@ enum
 };
 
 static void
-_update_ice_servers (GstWhipSink * whipsink, const gchar *link)
+_update_ice_servers (GstWhipSink * whipsink, const gchar * link_header)
 {
   int i = 0;
-  gchar **links = g_strsplit (link, ", ", -1);
-  while (links[i] != NULL) {
-    GST_DEBUG_OBJECT (whipsink, "%s", links[i]);
+  gchar **lists = g_strsplit (link_header, ", ", -1);
+
+  while (lists[i] != NULL) {
+
+    GST_DEBUG_OBJECT (whipsink, "%s", lists[i]);
+    gchar *ice_server = g_strstr_len (lists[i], -1, "rel=\"ice-server\"");
+
+    if (ice_server) {
+      int j = 0;
+      gchar **members = g_strsplit (lists[i], "; ", -1);
+      gchar *stun_svr = NULL;
+      gchar *turn_svr = NULL, *turn_s_svr = NULL, *turn_user =
+          NULL, *turn_pass = NULL;
+      gchar *turn_cred_type = NULL;
+      while (members[j] != NULL) {
+        //todo can this be done using a lookup table or a hashmap
+
+        if (0 == g_ascii_strncasecmp (members[j], "<stun:", strlen ("<stun:"))) {
+
+          //start after leading '<stun:'
+          stun_svr = g_strdup (members[j] + strlen ("<stun:"));
+          //remove trailing '>'
+          stun_svr[strlen (stun_svr) - 1] = '\0';
+
+        } else if (0 == g_ascii_strncasecmp (members[j], "<turn:",
+                strlen ("<turn:"))) {
+
+          //start after leading '<turn:'
+          turn_svr = g_strdup (members[j] + strlen ("<turn:"));
+          //remove trailing '>'
+          turn_svr[strlen (turn_svr) - 1] = '\0';
+
+        } else if (0 == g_ascii_strncasecmp (members[j], "<turns:",
+                strlen ("<turns:"))) {
+
+          //start after leading '<turn:'
+          turn_s_svr = g_strdup (members[j] + strlen ("<turns:"));
+          //remove trailing '>'
+          turn_s_svr[strlen (turn_s_svr) - 1] = '\0';
+
+        } else if (0 == g_ascii_strncasecmp (members[j], "username=\"",
+                strlen ("username=\""))) {
+
+          //start after leading '"'
+          turn_user = g_strdup (members[j] + strlen ("username=\""));
+          //remove trailing '"'
+          turn_user[strlen (turn_user) - 1] = '\0';
+
+        } else if (0 == g_ascii_strncasecmp (members[j], "credential=\"",
+                strlen ("credential=\""))) {
+
+          //start after leading '"'
+          turn_pass = g_strdup (members[j] + strlen ("credential=\""));
+          //remove trailing '"'
+          turn_pass[strlen (turn_pass) - 1] = '\0';
+
+        } else if (0 == g_ascii_strncasecmp (members[j], "credential-type: \"",
+                strlen ("credential-type: \""))) {
+
+          //start after leading '"'
+          turn_cred_type =
+              g_strdup (members[j] + strlen ("credential-type: \""));
+          //remove trailing '"'
+          turn_cred_type[strlen (turn_cred_type) - 1] = '\0';
+
+        }
+        j++;
+      }
+
+      if (stun_svr) {
+
+        gchar *stun_url = g_strdup_printf ("stun://%s", stun_svr);
+        GST_DEBUG_OBJECT (whipsink, "stun url %s", stun_url);
+
+        //this overwrites the stun-server value set by set_property
+        g_object_set (whipsink->webrtcbin, "stun-server", stun_url, NULL);
+        g_free (stun_url);
+
+      } else if (turn_svr) {
+
+        if (!g_ascii_strncasecmp (turn_cred_type, "password",
+                strlen ("password")) && turn_user && turn_pass) {
+          gchar *turn_url =
+              g_strdup_printf ("turn://%s:%s@%s", turn_user, turn_pass,
+              turn_svr);
+
+          gboolean retval;
+          GST_DEBUG_OBJECT (whipsink, "turn url %s", turn_url);
+          g_signal_emit_by_name (whipsink->webrtcbin, "add-turn-server",
+              turn_url, &retval);
+          if (!retval)
+            GST_ERROR_OBJECT (whipsink, "failed to add-turn-server %s",
+                turn_url);
+          g_free (turn_url);
+
+        }
+      } else if (turn_s_svr) {
+
+        if (!g_ascii_strncasecmp (turn_cred_type, "password",
+                strlen ("password")) && turn_user && turn_pass) {
+          gchar *turn_s_url =
+              g_strdup_printf ("turns://%s:%s@%s", turn_user, turn_pass,
+              turn_s_svr);
+          gboolean retval;
+          GST_DEBUG_OBJECT (whipsink, "turns url %s", turn_s_url);
+          g_signal_emit_by_name (whipsink->webrtcbin, "add-turn-server",
+              turn_s_url, &retval);
+          if (!retval)
+            GST_ERROR_OBJECT (whipsink, "failed to add-turn-server %s",
+                turn_s_url);
+          g_free (turn_s_url);
+
+        }
+      }
+      g_strfreev (members);
+      g_free (stun_svr);
+      g_free (turn_svr);
+      g_free (turn_s_svr);
+      g_free (turn_user);
+      g_free (turn_pass);
+      g_free (turn_cred_type);
+    }
     i++;
   }
-  g_clear_pointer (&links, g_strfreev);
+  g_strfreev (lists);
 }
 
 static void
@@ -112,23 +232,23 @@ _configure_ice_servers_from_link_headers (GstWhipSink * whipsink)
       soup_message_new ("OPTIONS", (const char *) whipsink->whip_endpoint);
   guint status = soup_session_send_message (whipsink->soup_session, msg);
   if (status != 200 && status != 204) {
-    GST_ERROR_OBJECT (whipsink, " [%u] %s\n\n", status,
+    GST_DEBUG_OBJECT (whipsink, " [%u] %s\n\n", status,
         status ? msg->reason_phrase : "HTTP error");
     return;
   }
   GST_INFO_OBJECT (whipsink, "Updating ice servers from OPTIONS response");
-  const gchar *link =
+  const gchar *link_header =
       soup_message_headers_get_list (msg->response_headers, "link");
-  if (link) {
-    GST_DEBUG_OBJECT (whipsink, "link headers :%s", link);
-    _update_ice_servers (whipsink, link);
+  if (link_header) {
+    GST_DEBUG_OBJECT (whipsink, "link headers :%s", link_header);
+    _update_ice_servers (whipsink, link_header);
   }
-  g_object_unref(msg);
+  g_object_unref (msg);
 }
 
 static void
 _send_sdp (GstWhipSink * whipsink, GstWebRTCSessionDescription * desc,
-    gchar **answer)
+    gchar ** answer)
 {
   gchar *text;
 
@@ -136,7 +256,7 @@ _send_sdp (GstWhipSink * whipsink, GstWebRTCSessionDescription * desc,
 
   g_print ("%s : %s\n", __func__, text);
   SoupMessage *msg;
-  
+
   msg = soup_message_new ("POST", (const char *) whipsink->whip_endpoint);
   soup_message_set_request (msg, "application/sdp", SOUP_MEMORY_COPY,
       (const char *) text, strlen (text));
@@ -144,7 +264,10 @@ _send_sdp (GstWhipSink * whipsink, GstWebRTCSessionDescription * desc,
   g_print ("%s soup return %d :\n%s\n", __func__, status,
       msg->response_body->data);
   if (status == 201) {
-    *answer =  g_strdup(msg->response_body->data);
+    *answer = g_strdup (msg->response_body->data);
+  } else {
+    //todo handle else case
+    return;
   }
   const char *location =
       soup_message_headers_get_one (msg->response_headers, "location");
@@ -155,19 +278,20 @@ _send_sdp (GstWhipSink * whipsink, GstWebRTCSessionDescription * desc,
     GST_DEBUG_OBJECT (whipsink, "resource url is %s", whipsink->resource_url);
     soup_uri_free (uri);
   }
-  if (whipsink->use_link_headers) {
-    //update the ice-servers if they exist
-    const char *link =
-        soup_message_headers_get_list (msg->response_headers, "link");
-    if (link == NULL) {
-      GST_WARNING_OBJECT (whipsink,
-          "Link headers not found in the POST response");
-    } else {
-      GST_INFO_OBJECT (whipsink, "Updating ice servers from POST response");
-      _update_ice_servers (whipsink, link);
-    }
-  }
-  g_object_unref(msg);
+  // if (whipsink->use_link_headers) {
+  //   //update the ice-servers if they exist
+  //   const char *link_header =
+  //       soup_message_headers_get_list (msg->response_headers, "link");
+  //   if (link_header == NULL) {
+  //     GST_WARNING_OBJECT (whipsink,
+  //         "Link headers not found in the POST response");
+  //   } else {
+  //     GST_INFO_OBJECT (whipsink, "Updating ice servers from POST response - %s",
+  //         link_header);
+  //     _update_ice_servers (whipsink, link_header);
+  //   }
+  // }
+  g_object_unref (msg);
 }
 
 static void
@@ -184,46 +308,22 @@ _on_offer_created (GstPromise * promise, gpointer whipsink)
         &offer, NULL);
     gst_promise_unref (promise);
 
-    promise = gst_promise_new ();
-    g_signal_emit_by_name (webrtcbin, "set-local-description", offer, promise);
-    gst_promise_interrupt (promise);
-    gst_promise_unref (promise);
+    g_signal_emit_by_name (webrtcbin, "set-local-description", offer, NULL);
     gchar *answer = NULL;
     _send_sdp (ws, offer, &answer);
-    if (strstr (answer, "candidate") != NULL) {
-      int mlines = 0, i = 0;
-      gchar **lines = g_strsplit (answer, "\r\n", -1);
-      gchar *line = NULL;
-      while (lines[i] != NULL) {
-        line = lines[i];
-        if (strstr (line, "m=") == line) {
-          /* New m-line */
-          mlines++;
-          if (mlines > 1)       /* We only need candidates from the first one */
-            break;
-        } else if (mlines == 1 && strstr (line, "a=candidate") != NULL) {
-          /* Found a candidate, fake a trickle */
-          line += 2;
-          g_signal_emit_by_name (webrtcbin, "add-ice-candidate", 0, line);
-        }
-        i++;
-      }
-      g_clear_pointer (&lines, g_strfreev);
-    }
+    if (answer == NULL)
+      return;
     GstWebRTCSessionDescription *answer_sdp;
     GstSDPMessage *sdp_msg;
     gst_sdp_message_new_from_text (answer, &sdp_msg);
     answer_sdp =
         gst_webrtc_session_description_new (GST_WEBRTC_SDP_TYPE_ANSWER,
         sdp_msg);
-    promise = gst_promise_new ();
     g_signal_emit_by_name (webrtcbin, "set-remote-description", answer_sdp,
-        promise);
-    gst_promise_interrupt (promise);
-    gst_promise_unref (promise);
+        NULL);
     gst_webrtc_session_description_free (offer);
     gst_webrtc_session_description_free (answer_sdp);
-    g_free(answer);
+    g_free (answer);
   }
 }
 
@@ -231,7 +331,7 @@ static void
 _on_negotiation_needed (GstElement * webrtcbin, gpointer user_data)
 {
   GstWhipSink *whipsink = GST_WHIP_SINK (user_data);
-  GST_ERROR_OBJECT (whipsink, " whipsink: %p...webrtcbin :%p \n", whipsink,
+  GST_DEBUG_OBJECT (whipsink, " whipsink: %p...webrtcbin :%p \n", whipsink,
       webrtcbin);
   GstPromise *promise =
       gst_promise_new_with_change_func (_on_offer_created, (gpointer) whipsink,
@@ -262,8 +362,8 @@ gst_whip_sink_class_init (GstWhipSinkClass * klass)
   gstelement_class->release_pad = GST_DEBUG_FUNCPTR (gst_whip_sink_release_pad);
   gstelement_class->state_changed =
       GST_DEBUG_FUNCPTR (gst_whip_sink_state_changed);
-  //gstelement_class->change_state =
-     // GST_DEBUG_FUNCPTR(gst_whip_sink_change_state);
+  // gstelement_class->change_state =
+  //  GST_DEBUG_FUNCPTR(gst_whip_sink_change_state);
 
   /* Setting up pads and setting metadata should be moved to
      base_class_init if you intend to subclass this class. */
@@ -280,31 +380,32 @@ gst_whip_sink_class_init (GstWhipSinkClass * klass)
       g_param_spec_string ("whip-endpoint", "WHIP Endpoint",
           "The WHIP server endpoint to POST SDP offer. "
           "e.g.: https://example.com/whip/endpoint/room1234",
-          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS 
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS
           | GST_PARAM_MUTABLE_READY));
 
   g_object_class_install_property (gobject_class,
       PROP_STUN_SERVER,
       g_param_spec_string ("stun-server", "STUN Server",
           "The STUN server of the form stun://hostname:port",
-          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS 
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS
           | GST_PARAM_MUTABLE_READY));
 
   g_object_class_install_property (gobject_class,
       PROP_TURN_SERVER,
       g_param_spec_string ("turn-server", "TURN Server",
           "The TURN server of the form turn(s)://username:password@host:port",
-          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS 
+          NULL, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS
           | GST_PARAM_MUTABLE_READY));
 
-    //todo: check bundle-policy is impacted by janus as well  
+  //todo: check bundle-policy is impacted by janus as well
   g_object_class_install_property (gobject_class,
       PROP_BUNDLE_POLICY,
       g_param_spec_enum ("bundle-policy", "Bundle Policy",
           "The policy to apply for bundling",
           GST_TYPE_WEBRTC_BUNDLE_POLICY,
           GST_WEBRTC_BUNDLE_POLICY_NONE,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
+          GST_PARAM_MUTABLE_READY));
 
   g_object_class_install_property (gobject_class,
       PROP_USE_LINK_HEADERS,
@@ -312,7 +413,7 @@ gst_whip_sink_class_init (GstWhipSinkClass * klass)
           "Use Link Headers to cofigure ice-servers in the response from WHIP server. "
           "If set to TRUE and the WHIP server returns valid ice-servers, "
           "this property overrides the ice-servers values set using the stun-server and turn-server properties.",
-          TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS 
+          TRUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS
           | GST_PARAM_MUTABLE_READY));
 
 }
@@ -320,17 +421,26 @@ gst_whip_sink_class_init (GstWhipSinkClass * klass)
 static void
 gst_whip_sink_init (GstWhipSink * whipsink)
 {
-  whipsink->webrtcbin = gst_element_factory_make ("webrtcbin", "whip-webrtcbin");
+  whipsink->webrtcbin =
+      gst_element_factory_make ("webrtcbin", "whip-webrtcbin");
   gst_bin_add (GST_BIN (whipsink), whipsink->webrtcbin);
-  GST_ERROR_OBJECT (whipsink, " webrtcbin :%p", whipsink->webrtcbin);
   g_signal_connect (whipsink->webrtcbin, "on-negotiation-needed",
       G_CALLBACK (_on_negotiation_needed), (gpointer) whipsink);
+
+  // GstWebRTCRTPTransceiverDirection direction, trans_direction;
+  // GstWebRTCRTPTransceiver *trans;
+
+  // direction = GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDONLY;
+  // g_signal_emit_by_name (whipsink->webrtcbin, "add-transceiver", direction, NULL,
+  //     &trans);
+  // g_object_get (trans, "direction", &trans_direction, NULL);
+  // GST_DEBUG_OBJECT(whipsink, "new trans direction %d", trans_direction);
   whipsink->resource_url = NULL;
   whipsink->soup_session = soup_session_new ();
-//   g_signal_connect (whipsink->webrtcbin, "on-ice-candidate",
-//       G_CALLBACK (send_ice_candidate_message), NULL);
-//   g_signal_connect (whipsink->webrtcbin, "notify::ice-gathering-state",
-//       G_CALLBACK (on_ice_gathering_state_notify), NULL);
+  // g_signal_connect (whipsink->webrtcbin, "on-ice-candidate",
+  //     G_CALLBACK (_send_ice_candidate_message), NULL);
+  // g_signal_connect (whipsink->webrtcbin, "notify::ice-gathering-state",
+  //     G_CALLBACK (_on_ice_gathering_state_notify), NULL);
 
 }
 
@@ -339,7 +449,7 @@ gst_whip_sink_set_property (GObject * object, guint property_id,
     const GValue * value, GParamSpec * pspec)
 {
   GstWhipSink *whipsink = GST_WHIP_SINK (object);
-  GST_DEBUG_OBJECT (whipsink, "...");
+  GST_DEBUG_OBJECT (whipsink, "property_id %d", property_id);
   switch (property_id) {
     case PROP_WHIP_ENDPOINT:
       GST_WHIP_SINK_LOCK (whipsink);
@@ -349,22 +459,22 @@ gst_whip_sink_set_property (GObject * object, guint property_id,
       break;
     case PROP_STUN_SERVER:
       GST_WHIP_SINK_LOCK (whipsink);
-      g_free (whipsink->stun_server);
-      //todo: why not set the prop to webrtcbin right away?
-      whipsink->stun_server = g_value_dup_string (value);
+      g_object_set (whipsink->webrtcbin, "stun-server",
+          g_value_dup_string (value), NULL);
       GST_WHIP_SINK_UNLOCK (whipsink);
       break;
 
     case PROP_TURN_SERVER:
       GST_WHIP_SINK_LOCK (whipsink);
-      g_free (whipsink->turn_server);
-      whipsink->turn_server = g_value_dup_string (value);
+      g_object_set (whipsink->webrtcbin, "turn-server",
+          g_value_dup_string (value), NULL);
       GST_WHIP_SINK_UNLOCK (whipsink);
       break;
 
     case PROP_BUNDLE_POLICY:
       GST_WHIP_SINK_LOCK (whipsink);
-      whipsink->bundle_policy = g_value_get_enum (value);
+      g_object_set (whipsink->webrtcbin, "bundle-policy",
+          g_value_get_enum (value), NULL);
       GST_WHIP_SINK_UNLOCK (whipsink);
       break;
 
@@ -385,21 +495,35 @@ gst_whip_sink_get_property (GObject * object, guint property_id,
     GValue * value, GParamSpec * pspec)
 {
   GstWhipSink *whipsink = GST_WHIP_SINK (object);
-  GST_DEBUG_OBJECT (whipsink, "...");
+
+  GST_DEBUG_OBJECT (whipsink, "prop id %d", property_id);
+
   switch (property_id) {
     case PROP_WHIP_ENDPOINT:
-      g_value_take_string (value, whipsink->whip_endpoint);
+      g_value_take_string (value, g_strdup (whipsink->whip_endpoint));
       break;
     case PROP_STUN_SERVER:
-      g_value_take_string (value, whipsink->turn_server);
-      break;
+    {
+      gchar *stun_svr = NULL;
+      g_object_get (whipsink->webrtcbin, "stun-server", &stun_svr, NULL);
+      g_value_take_string (value, stun_svr);
+    }
 
+      break;
     case PROP_TURN_SERVER:
-      g_value_take_string (value, whipsink->stun_server);
+    {
+      gchar *turn_svr = NULL;
+      g_object_get (whipsink->webrtcbin, "turn-server", &turn_svr, NULL);
+      g_value_take_string (value, turn_svr);
+    }
       break;
 
     case PROP_BUNDLE_POLICY:
-      g_value_set_enum (value, whipsink->bundle_policy);
+    {
+      GstWebRTCBundlePolicy bundle_policy;
+      g_object_get (whipsink->webrtcbin, "bundle-policy", &bundle_policy, NULL);
+      g_value_set_enum (value, bundle_policy);
+    }
       break;
 
     case PROP_USE_LINK_HEADERS:
@@ -450,19 +574,9 @@ gst_whip_sink_request_new_pad (GstElement * element,
   GST_WHIP_SINK_LOCK (whipsink);
   GstPad *wb_sink_pad =
       gst_element_request_pad_simple (whipsink->webrtcbin, "sink_%u");
-    //todo sinkpad need not be a member
-  sinkpad =
-      gst_ghost_pad_new (gst_pad_get_name (wb_sink_pad), wb_sink_pad);
+  sinkpad = gst_ghost_pad_new (gst_pad_get_name (wb_sink_pad), wb_sink_pad);
   gst_element_add_pad (GST_ELEMENT_CAST (whipsink), sinkpad);
   gst_object_unref (wb_sink_pad);
-  // GstPadTemplate *wbin_pad_template = gst_element_class_get_pad_template (GST_ELEMENT_GET_CLASS
-  //       (whipsink->webrtcbin), "sink_%u");
-  // GstPad * wbin_pad =
-  //       gst_element_request_pad (whipsink->webrtcbin, wbin_pad_template, name, caps);
-  //       //gst_element_request_pad_simple (whipsink->webrtcbin, "sink_%u");
-  // whipsink->sinkpad = gst_ghost_pad_new_from_template (gst_pad_get_name (wbin_pad), wbin_pad, templ);
-  // gst_element_add_pad (GST_ELEMENT (whipsink), whipsink->sinkpad);
-
   GST_WHIP_SINK_UNLOCK (whipsink);
   return sinkpad;
 }
@@ -475,7 +589,6 @@ gst_whip_sink_release_pad (GstElement * element, GstPad * pad)
   GST_INFO_OBJECT (pad, "releasing request pad");
   GST_WHIP_SINK_LOCK (whipsink);
 
-    //todo check with change 
   GstPad *wbin_pad = gst_pad_get_peer (pad);
   gst_element_release_request_pad (whipsink->webrtcbin, wbin_pad);
   gst_object_unref (wbin_pad);
@@ -488,20 +601,16 @@ gst_whip_sink_state_changed (GstElement * element, GstState oldstate,
     GstState newstate, GstState pending)
 {
   GstWhipSink *whipsink = GST_WHIP_SINK (element);
-  GST_DEBUG_OBJECT (whipsink, "oldstate %d pending state: %d newstate %d..",oldstate, pending, newstate);
+  GST_DEBUG_OBJECT (whipsink, "oldstate %d pending state: %d newstate %d..",
+      oldstate, pending, newstate);
   switch (newstate) {
     case GST_STATE_READY:
-      if (pending == GST_STATE_VOID_PENDING &&
-            oldstate == GST_STATE_NULL) {
+      if (pending == GST_STATE_VOID_PENDING && oldstate == GST_STATE_NULL) {
         GST_DEBUG_OBJECT (whipsink, "current state %d", newstate);
-        g_object_set(whipsink->webrtcbin, "bundle-policy", whipsink->bundle_policy, NULL);
         if (whipsink->use_link_headers) {
-            //todo what if the transition is blocked longer due to network call. 
-            //Think about returning ASYNC and cancel transition if there is a request to tear down the pipeline
+          //todo what if the transition is blocked longer due to network call. 
+          //Think about returning ASYNC and cancel transition if there is a request to tear down the pipeline
           _configure_ice_servers_from_link_headers (whipsink);
-        } else {
-            g_object_set(whipsink->webrtcbin, "turn-server", whipsink->turn_server, NULL);
-            g_object_set(whipsink->webrtcbin, "stun-server", whipsink->stun_server, NULL);
         }
       }
       break;

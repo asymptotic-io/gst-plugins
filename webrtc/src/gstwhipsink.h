@@ -43,16 +43,12 @@ typedef struct _GstWhipSinkClass GstWhipSinkClass;
 struct _GstWhipSink
 {
   GstBin parent;
-  GstPad *sinkpad;
   GstElement *webrtcbin;
   SoupSession *soup_session;
   char *resource_url;
   GMutex state_lock;
   GMutex lock;
   gchar *whip_endpoint;
-  gchar *stun_server;
-  gchar *turn_server;
-  GstWebRTCBundlePolicy bundle_policy;
   gboolean use_link_headers;
 };
 
