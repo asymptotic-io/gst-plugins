@@ -1,5 +1,5 @@
 /* GStreamer
- * Copyright (C) 2022 Taruntej Kanakamalla <taruntejk@live.com>
+ * Copyright (C) 2022 Taruntej Kanakamalla <taruntej@asymptotic.io>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -43,7 +43,9 @@
 #include "gst/gstpad.h"
 #include "gst/gstpadtemplate.h"
 #include "gst/gstparamspecs.h"
+#include "gst/gstpromise.h"
 #include "gstwhipsink.h"
+#include "libsoup/soup-session.h"
 #include "libsoup/soup-uri.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_whip_sink_debug_category);
@@ -68,10 +70,10 @@ static void gst_whip_sink_finalize (GObject * object);
 static GstPad *gst_whip_sink_request_new_pad (GstElement * element,
     GstPadTemplate * templ, const gchar * name, const GstCaps * caps);
 static void gst_whip_sink_release_pad (GstElement * element, GstPad * pad);
-static void gst_whip_sink_state_changed (GstElement * element,
-    GstState oldstate, GstState newstate, GstState pending);
 static GstStateChangeReturn gst_whip_sink_change_state (GstElement * element,
     GstStateChange transition);
+static void do_async_done (GstWhipSink * whipsink);
+static void do_async_start (GstWhipSink * whipsink);
 
 /* pad templates */
 
@@ -225,28 +227,6 @@ _update_ice_servers (GstWhipSink * whipsink, const gchar * link_header)
 }
 
 static void
-_configure_ice_servers_from_link_headers (GstWhipSink * whipsink)
-{
-  GST_DEBUG_OBJECT (whipsink, " Using link headers to get ice-servers");
-  SoupMessage *msg =
-      soup_message_new ("OPTIONS", (const char *) whipsink->whip_endpoint);
-  guint status = soup_session_send_message (whipsink->soup_session, msg);
-  if (status != 200 && status != 204) {
-    GST_DEBUG_OBJECT (whipsink, " [%u] %s\n\n", status,
-        status ? msg->reason_phrase : "HTTP error");
-    return;
-  }
-  GST_INFO_OBJECT (whipsink, "Updating ice servers from OPTIONS response");
-  const gchar *link_header =
-      soup_message_headers_get_list (msg->response_headers, "link");
-  if (link_header) {
-    GST_DEBUG_OBJECT (whipsink, "link headers :%s", link_header);
-    _update_ice_servers (whipsink, link_header);
-  }
-  g_object_unref (msg);
-}
-
-static void
 _send_sdp (GstWhipSink * whipsink, GstWebRTCSessionDescription * desc,
     gchar ** answer)
 {
@@ -254,14 +234,14 @@ _send_sdp (GstWhipSink * whipsink, GstWebRTCSessionDescription * desc,
 
   text = gst_sdp_message_as_text (desc->sdp);
 
-  g_print ("%s : %s\n", __func__, text);
+  GST_DEBUG_OBJECT (whipsink, "...\n%s", text);
   SoupMessage *msg;
 
   msg = soup_message_new ("POST", (const char *) whipsink->whip_endpoint);
   soup_message_set_request (msg, "application/sdp", SOUP_MEMORY_COPY,
       (const char *) text, strlen (text));
   guint status = soup_session_send_message (whipsink->soup_session, msg);
-  g_print ("%s soup return %d :\n%s\n", __func__, status,
+  GST_DEBUG_OBJECT (whipsink, "msg status %u \n%s", status,
       msg->response_body->data);
   if (status == 201) {
     *answer = g_strdup (msg->response_body->data);
@@ -294,11 +274,12 @@ _send_sdp (GstWhipSink * whipsink, GstWebRTCSessionDescription * desc,
   g_object_unref (msg);
 }
 
+
 static void
-_on_offer_created (GstPromise * promise, gpointer whipsink)
+_on_offer_created (GstPromise * promise, gpointer userdata)
 {
-  GstWhipSink *ws = (GstWhipSink *) whipsink;
-  gpointer webrtcbin = (gpointer) ws->webrtcbin;
+  GstWhipSink *ws = GST_WHIP_SINK (userdata);
+  gpointer webrtcbin = ws->webrtcbin;
   if (gst_promise_wait (promise) == GST_PROMISE_RESULT_REPLIED) {
     GstWebRTCSessionDescription *offer;
     const GstStructure *reply;
@@ -307,7 +288,7 @@ _on_offer_created (GstPromise * promise, gpointer whipsink)
     gst_structure_get (reply, "offer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION,
         &offer, NULL);
     gst_promise_unref (promise);
-
+    //todo add ice candidates from the ice-server
     g_signal_emit_by_name (webrtcbin, "set-local-description", offer, NULL);
     gchar *answer = NULL;
     _send_sdp (ws, offer, &answer);
@@ -328,15 +309,87 @@ _on_offer_created (GstPromise * promise, gpointer whipsink)
 }
 
 static void
+_http_options_response_callback (SoupSession * session, SoupMessage * msg,
+    gpointer userdata)
+{
+  GstWhipSink *whipsink = GST_WHIP_SINK (userdata);
+  if (msg->status_code != 200 && msg->status_code != 204) {
+    GST_DEBUG_OBJECT (whipsink, " [%u] %s\n\n", msg->status_code,
+        msg->status_code ? msg->reason_phrase : "HTTP error");
+  } else {
+    GST_INFO_OBJECT (whipsink, "Updating ice servers from OPTIONS response");
+    const gchar *link_header =
+        soup_message_headers_get_list (msg->response_headers, "link");
+    if (link_header) {
+      GST_DEBUG_OBJECT (whipsink, "link headers :%s", link_header);
+      _update_ice_servers (whipsink, link_header);
+    }
+
+    GstPromise *promise = gst_promise_new_with_change_func (_on_offer_created,
+        (gpointer) whipsink,
+        NULL);
+    g_signal_emit_by_name ((gpointer) whipsink->webrtcbin, "create-offer", NULL,
+        promise);
+  }
+}
+
+static void
+_configure_ice_servers_from_link_headers (GstWhipSink * whipsink,
+    gboolean async)
+{
+  GST_DEBUG_OBJECT (whipsink, " Using link headers to get ice-servers");
+  SoupMessage *msg =
+      soup_message_new ("OPTIONS", (const char *) whipsink->whip_endpoint);
+  if (async) {
+    soup_session_queue_message (whipsink->soup_session, msg,
+        _http_options_response_callback, whipsink);
+  } else {
+    guint status = soup_session_send_message (whipsink->soup_session, msg);
+    if (status != 200 && status != 204) {
+      GST_DEBUG_OBJECT (whipsink, " [%u] %s\n\n", status,
+          status ? msg->reason_phrase : "HTTP error");
+    } else {
+      GST_INFO_OBJECT (whipsink, "Updating ice servers from OPTIONS response");
+      const gchar *link_header =
+          soup_message_headers_get_list (msg->response_headers, "link");
+      if (link_header) {
+        GST_DEBUG_OBJECT (whipsink, "link headers :%s", link_header);
+        _update_ice_servers (whipsink, link_header);
+      }
+
+      GstPromise *promise = gst_promise_new_with_change_func (_on_offer_created,
+          (gpointer) whipsink,
+          NULL);
+      g_signal_emit_by_name ((gpointer) whipsink->webrtcbin, "create-offer",
+          NULL, promise);
+    }
+    g_object_unref (msg);
+  }
+}
+
+static void
 _on_negotiation_needed (GstElement * webrtcbin, gpointer user_data)
 {
   GstWhipSink *whipsink = GST_WHIP_SINK (user_data);
   GST_DEBUG_OBJECT (whipsink, " whipsink: %p...webrtcbin :%p \n", whipsink,
       webrtcbin);
-  GstPromise *promise =
-      gst_promise_new_with_change_func (_on_offer_created, (gpointer) whipsink,
-      NULL);
-  g_signal_emit_by_name ((gpointer) webrtcbin, "create-offer", NULL, promise);
+  if (whipsink->use_link_headers)
+    _configure_ice_servers_from_link_headers (whipsink, TRUE);
+  else {
+    GstPromise *promise = gst_promise_new_with_change_func (_on_offer_created,
+        (gpointer) whipsink,
+        NULL);
+    g_signal_emit_by_name ((gpointer) webrtcbin, "create-offer", NULL, promise);
+  }
+}
+
+static void
+_gather_ice_candidate (GstElement * webrtc G_GNUC_UNUSED, guint mlineindex,
+    gchar * candidate, gpointer user_data G_GNUC_UNUSED)
+{
+  GstWhipSink *whipsink = GST_WHIP_SINK (user_data);
+  GST_DEBUG_OBJECT (whipsink, "%u : %s", mlineindex, candidate);
+  //todo add ice candidate to the queue
 }
 
 /* class initialization */
@@ -360,19 +413,15 @@ gst_whip_sink_class_init (GstWhipSinkClass * klass)
   gstelement_class->request_new_pad =
       GST_DEBUG_FUNCPTR (gst_whip_sink_request_new_pad);
   gstelement_class->release_pad = GST_DEBUG_FUNCPTR (gst_whip_sink_release_pad);
-  gstelement_class->state_changed =
-      GST_DEBUG_FUNCPTR (gst_whip_sink_state_changed);
   // gstelement_class->change_state =
-  //  GST_DEBUG_FUNCPTR(gst_whip_sink_change_state);
+  //     GST_DEBUG_FUNCPTR(gst_whip_sink_change_state);
 
-  /* Setting up pads and setting metadata should be moved to
-     base_class_init if you intend to subclass this class. */
   gst_element_class_add_static_pad_template (GST_ELEMENT_CLASS (klass),
       &gst_whip_sink_sink_template);
 
   gst_element_class_set_static_metadata (GST_ELEMENT_CLASS (klass),
       "WHIP Bin", "Sink/Network/WebRTC",
-      "A bin for WebRTC-HTTP ingestion protocol (WHIP)",
+      "A bin for WebRTC HTTP ingestion protocol (WHIP)",
       "Taruntej Kanakamalla <taruntej@asymptotic.io>");
 
   g_object_class_install_property (gobject_class,
@@ -436,11 +485,11 @@ gst_whip_sink_init (GstWhipSink * whipsink)
   // g_object_get (trans, "direction", &trans_direction, NULL);
   // GST_DEBUG_OBJECT(whipsink, "new trans direction %d", trans_direction);
   whipsink->resource_url = NULL;
-  whipsink->soup_session = soup_session_new ();
+  whipsink->soup_session = soup_session_new_with_options ("timeout", 30, NULL);
   // g_signal_connect (whipsink->webrtcbin, "on-ice-candidate",
-  //     G_CALLBACK (_send_ice_candidate_message), NULL);
+  //     G_CALLBACK (_gather_ice_candidate);
   // g_signal_connect (whipsink->webrtcbin, "notify::ice-gathering-state",
-  //     G_CALLBACK (_on_ice_gathering_state_notify), NULL);
+  //     G_CALLBACK (_on_ice_gathering_state_change), whipsink);
 
 }
 
@@ -597,24 +646,82 @@ gst_whip_sink_release_pad (GstElement * element, GstPad * pad)
 }
 
 static void
-gst_whip_sink_state_changed (GstElement * element, GstState oldstate,
-    GstState newstate, GstState pending)
+do_async_start (GstWhipSink * whipsink)
 {
+  if (!whipsink->do_async) {
+    GstMessage *msg = gst_message_new_async_start (GST_OBJECT_CAST (whipsink));
+
+    GST_DEBUG_OBJECT (whipsink, "Posting async-start");
+    GST_BIN_CLASS (parent_class)->handle_message (GST_BIN_CAST (whipsink), msg);
+    whipsink->do_async = TRUE;
+  }
+}
+
+static void
+do_async_done (GstWhipSink * whipsink)
+{
+  if (whipsink->do_async) {
+    GstMessage *msg = gst_message_new_async_done (GST_OBJECT_CAST (whipsink),
+        GST_CLOCK_TIME_NONE);
+
+    GST_DEBUG_OBJECT (whipsink, "Posting async-done");
+    GST_BIN_CLASS (parent_class)->handle_message (GST_BIN_CAST (whipsink), msg);
+    whipsink->do_async = FALSE;
+  }
+}
+
+static GstStateChangeReturn
+gst_whip_sink_change_state (GstElement * element, GstStateChange transition)
+{
+  GstStateChangeReturn ret_state = GST_STATE_CHANGE_SUCCESS;
   GstWhipSink *whipsink = GST_WHIP_SINK (element);
-  GST_DEBUG_OBJECT (whipsink, "oldstate %d pending state: %d newstate %d..",
-      oldstate, pending, newstate);
-  switch (newstate) {
-    case GST_STATE_READY:
-      if (pending == GST_STATE_VOID_PENDING && oldstate == GST_STATE_NULL) {
-        GST_DEBUG_OBJECT (whipsink, "current state %d", newstate);
-        if (whipsink->use_link_headers) {
-          //todo what if the transition is blocked longer due to network call. 
-          //Think about returning ASYNC and cancel transition if there is a request to tear down the pipeline
-          _configure_ice_servers_from_link_headers (whipsink);
-        }
-      }
+
+  switch (transition) {
+    case GST_STATE_CHANGE_NULL_TO_READY:
+      // GST_WHIP_SINK_LOCK (whipsink);
+      // _configure_ice_servers_from_link_headers(whipsink, TRUE);
+      // do_async_start (whipsink);
+      // GST_WHIP_SINK_UNLOCK (whipsink);
+      // ret_state = GST_STATE_CHANGE_ASYNC;
       break;
+    case GST_STATE_CHANGE_READY_TO_PAUSED:
+      // GST_WHIP_SINK_LOCK (whipsink);
+      // _configure_ice_servers_from_link_headers(whipsink, TRUE);
+      // do_async_start (whipsink);
+      // GST_WHIP_SINK_UNLOCK (whipsink);
+      // ret_state = GST_STATE_CHANGE_ASYNC;
+      break;
+    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
+    case GST_STATE_CHANGE_NULL_TO_NULL:
+    case GST_STATE_CHANGE_READY_TO_READY:
+    case GST_STATE_CHANGE_PAUSED_TO_PAUSED:
+    case GST_STATE_CHANGE_PLAYING_TO_PLAYING:
     default:
       break;
   }
+
+  GstStateChangeReturn ret =
+      GST_ELEMENT_CLASS (parent_class)->change_state (element, transition);
+  if (ret == GST_STATE_CHANGE_FAILURE) {
+    GST_WHIP_SINK_LOCK (whipsink);
+    // do_async_done (whipsink);
+    GST_WHIP_SINK_UNLOCK (whipsink);
+    return ret;
+  }
+
+  switch (transition) {
+    case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
+      break;
+    case GST_STATE_CHANGE_PAUSED_TO_READY:
+      GST_WHIP_SINK_LOCK (whipsink);
+      // do_async_done (whipsink);
+      GST_WHIP_SINK_UNLOCK (whipsink);
+      break;
+    case GST_STATE_CHANGE_READY_TO_NULL:
+      //todo cancel/finish soup call if pending
+    default:
+      break;
+  }
+
+  return ret_state;
 }
