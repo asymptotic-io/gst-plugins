@@ -44,6 +44,7 @@
 #include "gst/gstpadtemplate.h"
 #include "gst/gstparamspecs.h"
 #include "gst/gstpromise.h"
+#include "gst/webrtc/webrtc_fwd.h"
 #include "gstwhipsink.h"
 #include "libsoup/soup-session.h"
 #include "libsoup/soup-uri.h"
@@ -373,6 +374,28 @@ _on_negotiation_needed (GstElement * webrtcbin, gpointer user_data)
   GstWhipSink *whipsink = GST_WHIP_SINK (user_data);
   GST_DEBUG_OBJECT (whipsink, " whipsink: %p...webrtcbin :%p \n", whipsink,
       webrtcbin);
+
+  //Set direction of the transceiver(s) to SENDONLY
+  GstWebRTCRTPTransceiver *trans;
+  GArray *transceivers = NULL;
+  GstWebRTCRTPTransceiverDirection new_dir;
+  g_signal_emit_by_name (whipsink->webrtcbin, "get-transceivers", &transceivers,
+      NULL);
+  if (transceivers != NULL) {
+    guint arr_len = transceivers->len;
+    GST_DEBUG_OBJECT (whipsink, "transceivers array len %u", arr_len);
+    for (guint i = 0; i < arr_len; i++) {
+      trans = g_array_index (transceivers, GstWebRTCRTPTransceiver *, i);
+      GST_DEBUG_OBJECT (whipsink, "trans arr index %u ", i);
+      g_object_set (trans, "direction",
+          GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDONLY, NULL);
+      g_object_get (trans, "direction", &new_dir, NULL);
+      GST_DEBUG_OBJECT (whipsink, "new trans direction %d", new_dir);
+    }
+  }
+  g_array_unref (transceivers);
+
+
   if (whipsink->use_link_headers)
     _configure_ice_servers_from_link_headers (whipsink, TRUE);
   else {
@@ -476,14 +499,6 @@ gst_whip_sink_init (GstWhipSink * whipsink)
   g_signal_connect (whipsink->webrtcbin, "on-negotiation-needed",
       G_CALLBACK (_on_negotiation_needed), (gpointer) whipsink);
 
-  // GstWebRTCRTPTransceiverDirection direction, trans_direction;
-  // GstWebRTCRTPTransceiver *trans;
-
-  // direction = GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDONLY;
-  // g_signal_emit_by_name (whipsink->webrtcbin, "add-transceiver", direction, NULL,
-  //     &trans);
-  // g_object_get (trans, "direction", &trans_direction, NULL);
-  // GST_DEBUG_OBJECT(whipsink, "new trans direction %d", trans_direction);
   whipsink->resource_url = NULL;
   whipsink->soup_session = soup_session_new_with_options ("timeout", 30, NULL);
   // g_signal_connect (whipsink->webrtcbin, "on-ice-candidate",
@@ -508,22 +523,22 @@ gst_whip_sink_set_property (GObject * object, guint property_id,
       break;
     case PROP_STUN_SERVER:
       GST_WHIP_SINK_LOCK (whipsink);
-      g_object_set (whipsink->webrtcbin, "stun-server",
-          g_value_dup_string (value), NULL);
+      g_object_set_property ((GObject *) whipsink->webrtcbin, "stun-server",
+          value);
       GST_WHIP_SINK_UNLOCK (whipsink);
       break;
 
     case PROP_TURN_SERVER:
       GST_WHIP_SINK_LOCK (whipsink);
-      g_object_set (whipsink->webrtcbin, "turn-server",
-          g_value_dup_string (value), NULL);
+      g_object_set_property ((GObject *) whipsink->webrtcbin, "turn-server",
+          value);
       GST_WHIP_SINK_UNLOCK (whipsink);
       break;
 
     case PROP_BUNDLE_POLICY:
       GST_WHIP_SINK_LOCK (whipsink);
-      g_object_set (whipsink->webrtcbin, "bundle-policy",
-          g_value_get_enum (value), NULL);
+      g_object_set_property ((GObject *) whipsink->webrtcbin, "bundle-policy",
+          value);
       GST_WHIP_SINK_UNLOCK (whipsink);
       break;
 
@@ -556,25 +571,22 @@ gst_whip_sink_get_property (GObject * object, guint property_id,
       gchar *stun_svr = NULL;
       g_object_get (whipsink->webrtcbin, "stun-server", &stun_svr, NULL);
       g_value_take_string (value, stun_svr);
-    }
-
       break;
+    }
     case PROP_TURN_SERVER:
     {
       gchar *turn_svr = NULL;
       g_object_get (whipsink->webrtcbin, "turn-server", &turn_svr, NULL);
       g_value_take_string (value, turn_svr);
-    }
       break;
-
+    }
     case PROP_BUNDLE_POLICY:
     {
       GstWebRTCBundlePolicy bundle_policy;
       g_object_get (whipsink->webrtcbin, "bundle-policy", &bundle_policy, NULL);
       g_value_set_enum (value, bundle_policy);
-    }
       break;
-
+    }
     case PROP_USE_LINK_HEADERS:
       g_value_set_boolean (value, whipsink->use_link_headers);
       break;

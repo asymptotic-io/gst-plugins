@@ -30,14 +30,8 @@
 #ifndef VERSION
 #define VERSION "0.0.1"
 #endif
-#ifndef PACKAGE
-#define PACKAGE "gst_demo_plugins_package"
-#endif
 #ifndef PACKAGE_NAME
-#define PACKAGE_NAME "gst_demo_plugins_package_name"
-#endif
-#ifndef GST_PACKAGE_ORIGIN
-#define GST_PACKAGE_ORIGIN "https://github.com/tkanakamalla/gst-demo-plugins"
+#define PACKAGE_NAME "gst_whipsink"
 #endif
 
 
@@ -45,28 +39,10 @@ static gboolean
 plugin_init (GstPlugin * plugin)
 {
 
-  /* FIXME Remember to set the rank if it's an element that is meant
-     to be autoplugged by decodebin. */
   return gst_element_register (plugin, "whipsink", GST_RANK_NONE,
       GST_TYPE_WHIP_SINK);
 }
 
-/* FIXME: these are normally defined by the GStreamer build system.
-   If you are creating an element to be included in gst-plugins-*,
-   remove these, as they're always defined.  Otherwise, edit as
-   appropriate for your external plugin package. */
-#ifndef VERSION
-#define VERSION "0.0.FIXME"
-#endif
-#ifndef PACKAGE
-#define PACKAGE "FIXME_package"
-#endif
-#ifndef PACKAGE_NAME
-#define PACKAGE_NAME "FIXME_package_name"
-#endif
-#ifndef GST_PACKAGE_ORIGIN
-#define GST_PACKAGE_ORIGIN "http://FIXME.org/"
-#endif
 
 GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
